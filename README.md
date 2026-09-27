@@ -122,11 +122,18 @@ Mono dataset uses `select_channels: [False, True, False]` to keep only the green
 ## Citation
 
 ```bibtex
-@article{2026metatele,
-  title={MetaTele: Compact Refractive Metasurface Computational Telephoto Camera},
-  author={Weligampola, Harshana and Chen, Yuanrui and Gnanasambandam, Abhiram and Godaliyadda, Dilshan and Sheikh, Hamid R and Chan, Stanley H and Guo, Qi},
-  journal={arXiv preprint arXiv:2604.07614},
-  year={2026}
+@article{Weligampola2026MetaTele,
+  title     = {MetaTele: compact refractive metasurface computational telephoto camera},
+  author    = {Weligampola, Harshana and Chen, Yuanrui and Gnanasambandam, Abhiram
+               and Godaliyadda, Dilshan and Sheikh, Hamid and Chan, Stanley
+               and Guo, Qi},
+  journal   = {Optics Express},
+  volume    = {34},
+  number    = {18},
+  pages     = {34880--34897},
+  year      = {2026},
+  publisher = {Optica Publishing Group},
+  url       = {https://opg.optica.org/oe/fulltext.cfm?uri=oe-34-18-34880}
 }
 ```
 
