@@ -16,8 +16,6 @@ Key components:
 - **RAM + DAPE** for automatic image captioning / text conditioning
 - **Losses:** L2, LPIPS, chroma (YCbCr), and VSD/KL (`lambda_*` in config)
 
-> **Note:** The `train.loss: 1*MSE` field in the YAML config is **not used**. Actual training losses are controlled by `lambda_l2`, `lambda_lpips`, `lambda_chroma`, and `lambda_kl`.
-
 ## Setup
 
 ### 1. Environment
@@ -68,12 +66,6 @@ Multi-GPU (Accelerate):
 accelerate launch --num_processes 8 trainer.py -opt configs/train.yml
 ```
 
-Slurm (Gilbreth):
-
-```bash
-sbatch scripts/slurm_train.sh
-```
-
 Quick validation run:
 
 ```bash
@@ -84,17 +76,17 @@ Outputs are saved under `./experiments/MetaZoom/`.
 
 ## Inference
 
-1. Set `path.resume_from_path` in `configs/infer.yml` to your trained experiment directory.
+1. Pick a config under `configs/infer_*.yml` (they differ by text-prompt extractor: `dape`, `florence`, `gemma`, `qwen`, `null`) and set `path.resume_from_path` to your trained experiment directory.
 2. Run:
 
 ```bash
-bash scripts/infer.sh
+python trainer.py -infer -opt configs/infer_dape.yml
 ```
 
-Or explicitly:
+Or run the configs preselected in `scripts/infer.sh`:
 
 ```bash
-python trainer.py -infer -opt configs/infer.yml
+bash scripts/infer.sh
 ```
 
 ## Metrics
@@ -141,4 +133,4 @@ Mono dataset uses `select_channels: [False, True, False]` to keep only the green
 
 ## License
 
-See [LICENSE](LICENSE). Replace with your chosen license before public release.
+MIT License. See [LICENSE](LICENSE).

@@ -150,7 +150,7 @@ datasets:
 path:
   root: ./experiments
   logging_dir: logs
-  resume_from_path: /scratch/gilbreth/wweligam/experiments/MetaZoom/MetaZoom_OSEDiff_olddata_baseline_no_vsd_2026_07_02_00_01_54/
+  resume_from_path: ./experiments/MetaZoom/MetaZoom_OSEDiff_olddata_baseline_no_vsd_2026_07_02_00_01_54/
   resume_from_checkpoint: latest
 
 train:

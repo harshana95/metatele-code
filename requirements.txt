@@ -24,6 +24,13 @@ tqdm
 numpy
 scipy
 
+# RAM + DAPE (text_prompt_extractor: ram_dape)
+timm
+fairscale
+loralib
+openai-clip
+ftfy
+
 # Experiment tracking (optional)
 tensorboard
 # comet_ml
