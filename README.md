@@ -36,14 +36,16 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 ### 2. Download pretrained weights
 
-Place the following files in `weights/`:
+`weights/DAPE.pth` (DAPE condition model weights) is bundled in this repo.
 
-| File | Description |
-|------|-------------|
-| `ram_swin_large_14m.pth` | RAM vision-language model weights |
-| `DAPE.pth` | DAPE condition model weights |
+Download the RAM vision-language model weights and place them at `weights/ram_swin_large_14m.pth`:
 
-SD 2.1 (`stabilityai/stable-diffusion-2-1`) is downloaded automatically from HuggingFace Hub on first run.
+```bash
+curl -L -o weights/ram_swin_large_14m.pth \
+  https://huggingface.co/spaces/xinyu1205/recognize-anything/resolve/main/ram_swin_large_14m.pth
+```
+
+SD 2.1 (`sd2-community/stable-diffusion-2-1`) is downloaded automatically from HuggingFace Hub on first run.
 
 ### 3. Datasets
 
