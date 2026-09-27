@@ -1,0 +1,641 @@
+import functools
+import gc
+import glob
+import importlib
+import os
+import random
+import time
+import einops
+import numpy as np
+import torch
+import lpips
+from tqdm import tqdm
+import torch.nn.functional as F
+from transformers import AutoTokenizer, CLIPTextModel
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, EMAModel, T2IAdapter
+from peft import LoraConfig
+from pipelines.OneStepDiffusionPipeline import OneStepDiffusionPipeline, hpf_adapter_input
+from models.OneStepDiffusion.prompt_extractors import build_prompt_extractor
+
+from torch.utils.data import DataLoader, Subset
+from models.base_model import BaseModel
+from utils.dataset_utils import merge_patches
+from utils import log_image, log_metrics, log_prompt
+
+from safetensors.torch import load_file
+
+def load_model_hook(models, input_dir):
+    saved = {}
+    while len(models) > 0:
+        # pop models so that they are not loaded again
+        model = models.pop()
+        class_name = model._get_name()
+        saved[class_name] = 1 if class_name not in saved.keys() else saved[class_name] + 1
+        print(f"Loading model {class_name}_{saved[class_name]} from {input_dir}")
+        # try:
+        #     c = find_attr(_arch_modules, class_name)
+        #     assert c is not None
+        # except ValueError as e:  # class is not written by us. Try to load from diffusers
+        #     print(f"Class {class_name} not found in archs. Trying to load from diffusers...")
+        #     m = importlib.import_module('diffusers') # load the module, will raise ImportError if module cannot be loaded
+        #     c = getattr(m, class_name)  # get the class, will raise AttributeError if class cannot be found    
+        
+        # load diffusers style into model
+        folder = os.path.join(input_dir, f"{class_name}_{saved[class_name]}")
+        combined_state_dict = {}
+    
+        for file_path in glob.glob(os.path.join(folder, "*.safetensors")):
+            state_dict_part = load_file(file_path)
+            combined_state_dict.update(state_dict_part)
+        try:
+            model.load_state_dict(combined_state_dict)
+        except Exception as e:
+            print(f"{'='*50} Failed to load {class_name} {'='*50} {model} {e}")
+        
+        # load_model = c.from_pretrained(os.path.join(input_dir, f"{class_name}_{saved[class_name]}"))
+        # model.load_state_dict(load_model.state_dict())
+        # del load_model
+        
+def initialize_unet(unet, lora_rank=128):
+    l_target_modules_encoder, l_target_modules_decoder, l_modules_others = [], [], []
+    l_grep = ["to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_in", "conv_shortcut", "conv_out", "proj_out", "proj_in", "ff.net.2", "ff.net.0.proj"]
+    for n, p in unet.named_parameters():
+        if "bias" in n or "norm" in n:
+            continue
+        for pattern in l_grep:
+            if pattern in n and ("down_blocks" in n or "conv_in" in n):
+                l_target_modules_encoder.append(n.replace(".weight",""))
+                break
+            elif pattern in n and ("up_blocks" in n or "conv_out" in n):
+                l_target_modules_decoder.append(n.replace(".weight",""))
+                break
+            elif pattern in n:
+                l_modules_others.append(n.replace(".weight",""))
+                break
+
+    lora_conf_encoder = LoraConfig(r=lora_rank, init_lora_weights="gaussian",target_modules=l_target_modules_encoder)
+    lora_conf_decoder = LoraConfig(r=lora_rank, init_lora_weights="gaussian",target_modules=l_target_modules_decoder)
+    lora_conf_others = LoraConfig(r=lora_rank, init_lora_weights="gaussian",target_modules=l_modules_others)
+    unet.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+    unet.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
+    unet.add_adapter(lora_conf_others, adapter_name="default_others")
+    unet.set_adapter(['default_encoder', 'default_decoder', 'default_others'])  
+    return unet
+
+def initialize_vae(vae, lora_rank=4):
+    l_target_modules_encoder = []
+    l_grep = ["conv1","conv2","conv_in", "conv_shortcut", "conv", "conv_out", "to_k", "to_q", "to_v", "to_out.0"]
+    for n, p in vae.named_parameters():
+        if "bias" in n or "norm" in n: 
+            continue
+        for pattern in l_grep:
+            if pattern in n and ("encoder" in n):
+                l_target_modules_encoder.append(n.replace(".weight",""))
+            elif ('quant_conv' in n) and ('post_quant_conv' not in n):
+                l_target_modules_encoder.append(n.replace(".weight",""))
+    
+    lora_conf_encoder = LoraConfig(r=lora_rank, init_lora_weights="gaussian",target_modules=l_target_modules_encoder)
+    vae.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+    vae.set_adapter(['default_encoder'])
+    return vae
+
+def eps_to_mu(scheduler, model_output, sample, timesteps):
+    alphas_cumprod = scheduler.alphas_cumprod.to(device=sample.device, dtype=sample.dtype)
+    alpha_prod_t = alphas_cumprod[timesteps]
+    while len(alpha_prod_t.shape) < len(sample.shape):
+        alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+    beta_prod_t = 1 - alpha_prod_t
+    pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+    return pred_original_sample
+
+def encode_prompt(prompt_batch, tokenizer, text_encoder):
+    prompt_embeds_list = []
+    with torch.no_grad():
+        for caption in prompt_batch:
+            text_input_ids = tokenizer(
+                caption, max_length=tokenizer.model_max_length,
+                padding="max_length", truncation=True, return_tensors="pt"
+            ).input_ids
+            prompt_embeds = text_encoder(
+                text_input_ids.to(text_encoder.device),
+            )[0]
+            prompt_embeds_list.append(prompt_embeds)
+    prompt_embeds = torch.concat(prompt_embeds_list, dim=0)
+    return prompt_embeds
+
+class onedataset_model(BaseModel):
+    def __init__(self, opt, logger):
+        super(onedataset_model, self).__init__(opt, logger)
+        self.load_handle.remove()
+        self.load_handle = self.accelerator.register_load_state_pre_hook(load_model_hook)
+        weight_dtype = torch.float32
+        if self.accelerator.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif self.accelerator.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
+        self.weight_dtype = weight_dtype
+
+        self.concatenate_images = self.opt.train.get('concatenate_images', False)
+        self.use_hf_loss = self.opt.train.get('use_hf_loss', False)
+        self.use_adapter = self.opt.train.get('use_adapter', False)
+
+        if self.use_hf_loss:
+            self.MASK_CLIP = 5e-1
+            alpha = self.opt.train.get('alpha', 1.0)
+            gamma = self.opt.train.get('gamma', 1.0)
+            beta = self.opt.train.get('beta', 0.0)
+            # build weight map for FT transformed image
+            res = opt.image_resolution[0] // 8 # //8 because we are adding noise in latent space
+            x = torch.linspace(-1, 1, res, device='cuda') * alpha
+            y = torch.linspace(-1, 1, res, device='cuda') * alpha
+            grid_x, grid_y = torch.meshgrid(x, y) # Create 2D coordinate grids
+            radial_distances = torch.sqrt(grid_x**2 + grid_y**2) # Calculate radial distances
+            radial_distances = radial_distances**gamma
+            radial_distances = (radial_distances + beta).clip(0, 1)  # more than 1 should be clipped
+            self.HPF = radial_distances.unsqueeze(0).unsqueeze(0)
+            
+        self.neg_caption = "painting, oil painting, illustration, drawing, art, sketch, cartoon, CG Style, 3D render, unreal engine, blurring, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, deformed, lowres, over-smooth"
+
+        pretrained_model_name_or_path = self.opt.pretrained_model_name_or_path
+        revision = self.opt.revision
+        variant = self.opt.variant
+
+        self.lambda_l2 = self.opt.train.lambda_l2
+        self.lambda_lpips = self.opt.train.lambda_lpips
+        # Extra supervision for color fidelity in a perceptually meaningful chroma space.
+        # When 0.0, behavior matches the original implementation.
+        self.lambda_chroma = self.opt.train.get('lambda_chroma', 0.0)
+        self.lambda_kl = self.opt.train.get('lambda_kl', 1.0)
+        self.cfg_vsd = self.opt.train.cfg_vsd
+
+        self.net_lpips = lpips.LPIPS(net='vgg').cuda()
+        self.net_lpips.requires_grad_(False)
+
+        if self.use_adapter and opt.train.hpf_adapter_input:
+            self.adapter_preprocess = hpf_adapter_input
+        else:
+            self.adapter_preprocess = lambda x: x
+
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer", local_files_only=True)
+        self.text_encoder = CLIPTextModel.from_pretrained(pretrained_model_name_or_path, subfolder="text_encoder", local_files_only=True).cuda()
+        self.noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler", local_files_only=True)
+        self.noise_scheduler.set_timesteps(timesteps=[self.opt.train.timestep], device="cuda")
+        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
+        # one step prediction. choose t=T
+        self.timesteps = self.noise_scheduler.timesteps
+        print(f"Timesteps : {self.timesteps}")
+        
+        self.vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", revision=revision, variant=variant, local_files_only=True)
+        self.unet = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, subfolder="unet", revision=revision, variant=variant, local_files_only=True)
+        self.unet.train()
+
+        # use adapter for high-frequency injection
+        if self.use_adapter:
+            self.t2iadapter = T2IAdapter(
+                in_channels=opt.train.adapter_in_channels,
+                channels=(320, 640, 1280, 1280),
+                num_res_blocks=2,
+                downscale_factor=8,
+                adapter_type="full_adapter",
+            )
+            self.models.append(self.t2iadapter)
+
+
+        # for VSD loss
+        self.noise_scheduler_reg = DDPMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler", local_files_only=True)
+        self.unet_fix = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, subfolder="unet", revision=revision, variant=variant, local_files_only=True)
+        self.unet_update = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, subfolder="unet", revision=revision, variant=variant, local_files_only=True)
+        self.unet_update.train()
+        
+        self.unet_fix.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
+
+        # Create EMA for the unet.
+        if opt.use_ema:
+            #self.ema_unet = EMAModel(self.unet.parameters(), model_cls=UNet2DConditionModel, model_config=self.unet.config)
+            print(f"{'='*50} NO EMA")
+
+        if opt.train.lora_finetune:
+            self.unet.requires_grad_(False)
+            self.unet_update.requires_grad_(False)
+            self.vae.requires_grad_(False)
+
+            lora_rank = opt.train.get('lora_rank', 128)
+            lora_rank_vae = opt.train.get('lora_rank_vae', 4)
+            self.unet = initialize_unet(self.unet, lora_rank)
+            self.unet_update = initialize_unet(self.unet_update, lora_rank)
+            self.vae = initialize_vae(self.vae, lora_rank_vae)
+            
+            self.vae.set_adapter(['default_encoder'])
+            self.unet.set_adapter(['default_encoder', 'default_decoder', 'default_others'])
+            self.unet_update.set_adapter(['default_encoder', 'default_decoder', 'default_others'])
+
+            for n, _p in self.vae.named_parameters():
+                if "lora" in n:
+                    _p.requires_grad = True
+            self.unet.conv_in.requires_grad_(True)
+            for n, _p in self.unet.named_parameters():
+                if "lora" in n:
+                    _p.requires_grad = True
+            for n, _p in self.unet_update.named_parameters():
+                if "lora" in n:
+                    _p.requires_grad = True
+        else:
+            self.vae.requires_grad_(True)
+            self.unet.requires_grad_(True)
+            self.unet_update.requires_grad_(True)
+        
+        if self.concatenate_images:
+            self.vae.encoder.conv_in = torch.nn.Conv2d(6, 128, kernel_size=3, stride=1, padding=1)
+            self.vae.encoder.conv_in.requires_grad = True
+
+            
+        self.models.append(self.vae)
+        self.models.append(self.unet)
+        self.models.append(self.unet_update)
+
+        self.prompt_extractor = build_prompt_extractor(opt)
+        self.prompt_extractor.setup(self.accelerator.device)
+
+        self.unet_fix.to(self.accelerator.device, dtype=torch.float16)
+        
+        
+    def setup_optimizers(self):
+        opt = self.opt.train.optim
+
+        # Optimizer creation for generator
+        optimizer_class = torch.optim.AdamW
+        self.gen_params = [p for p in self.unet.parameters() if p.requires_grad]
+        self.gen_params += [p for p in self.vae.parameters() if p.requires_grad]
+        if self.use_adapter:
+            self.gen_params += [p for p in self.t2iadapter.parameters() if p.requires_grad]
+        optimizer = optimizer_class(
+            self.gen_params,
+            lr=opt.learning_rate,
+            betas=(opt.adam_beta1, opt.adam_beta2),
+            weight_decay=opt.adam_weight_decay,
+            eps=opt.adam_epsilon,
+            )
+        self.optimizers.append(optimizer)
+
+        # Optimizer creation for VSD
+        optimizer_class = torch.optim.AdamW
+        self.reg_params = [p for p in self.unet_update.parameters() if p.requires_grad]
+        optimizer_vsd = optimizer_class(
+            self.reg_params,
+            lr=opt.learning_rate,
+            betas=(opt.adam_beta1, opt.adam_beta2),
+            weight_decay=opt.adam_weight_decay,
+            eps=opt.adam_epsilon,
+            )
+        self.optimizers.append(optimizer_vsd)
+
+
+    def feed_data(self, data, is_train=True):
+        self.sample = data
+        gt_key = self.dataloader.dataset.gt_key if is_train else self.test_dataloader.dataset.gt_key
+        lq_key = self.dataloader.dataset.lq_key if is_train else self.test_dataloader.dataset.lq_key
+        
+        # # make SR for testing
+        # gt_1 = self.sample[gt_key+"_1"]
+        # image_1 = F.interpolate(gt_1, size=(128,128), mode='bicubic')
+        # image_1 = F.interpolate(image_1, size=(512,512), mode='bicubic')
+        # self.sample[lq_key+"_1"] = image_1
+
+        if self.opt.train.patched if is_train else self.opt.val.patched:
+            self.grids(keys=[lq_key, gt_key], 
+                       opt=self.opt.train if is_train else self.opt.val)
+    
+    def _optimize_parameters(self, denoised_latents, gt_1, prompt_embeds, neg_prompt_embeds):
+        bsz = denoised_latents.shape[0]
+        output_image = (self.vae.decode(denoised_latents / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+
+        # loss data
+        loss_l2 = F.mse_loss(output_image.float(), gt_1.float(), reduction="mean") * self.lambda_l2
+        loss_lpips = self.net_lpips(output_image.float(), gt_1.float()).mean() * self.lambda_lpips
+        loss_chroma = output_image.new_tensor(0.0)
+        if self.lambda_chroma != 0.0:
+            # Convert RGB in [-1, 1] to [0, 1], then supervise only chroma (Cb/Cr) in YCbCr.
+            rgb01 = (output_image.float() + 1.0) * 0.5
+            gt01 = (gt_1.float() + 1.0) * 0.5
+
+            r = rgb01[:, 0:1]
+            g = rgb01[:, 1:2]
+            b = rgb01[:, 2:3]
+            y = 0.299 * r + 0.587 * g + 0.114 * b
+            cb = 0.564 * (b - y) + 0.5
+            cr = 0.713 * (r - y) + 0.5
+
+            r_gt = gt01[:, 0:1]
+            g_gt = gt01[:, 1:2]
+            b_gt = gt01[:, 2:3]
+            y_gt = 0.299 * r_gt + 0.587 * g_gt + 0.114 * b_gt
+            cb_gt = 0.564 * (b_gt - y_gt) + 0.5
+            cr_gt = 0.713 * (r_gt - y_gt) + 0.5
+
+            eps = 1e-3
+            def charbonnier(diff):
+                return torch.mean(torch.sqrt(diff * diff + eps * eps))
+
+            loss_cb = charbonnier(cb - cb_gt)
+            loss_cr = charbonnier(cr - cr_gt)
+            loss_chroma = 0.5 * (loss_cb + loss_cr)
+
+        loss_data = self.lambda_l2*loss_l2 + self.lambda_lpips * loss_lpips + self.lambda_chroma * loss_chroma
+
+        if self.lambda_kl == 0.0:
+            self.accelerator.backward(loss_data)
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.gen_params, 1.0)
+            self.optimizers[0].step()
+            self.optimizers[0].zero_grad()
+            return {'all': loss_data, 
+                'l2': loss_l2, 
+                'lpips': loss_lpips, 
+                'chroma': loss_chroma,
+            }
+        
+        # loss distribution KL
+        timesteps = torch.randint(20, 980, (bsz,), device=denoised_latents.device).long()
+        noise = torch.randn_like(denoised_latents)
+        noisy_latents = self.noise_scheduler_reg.add_noise(denoised_latents, noise, timesteps)
+        with torch.no_grad():
+            noise_pred_update = self.unet_update(
+                noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds.float(),
+                ).sample
+
+            x0_pred_update = eps_to_mu(self.noise_scheduler_reg, noise_pred_update, noisy_latents, timesteps)
+
+            noisy_latents_input = torch.cat([noisy_latents] * 2)
+            timesteps_input = torch.cat([timesteps] * 2)
+            prompt_embeds_concat = torch.cat([neg_prompt_embeds, prompt_embeds], dim=0)
+
+            noise_pred_fix = self.unet_fix(
+                noisy_latents_input.to(dtype=torch.float16),
+                timestep=timesteps_input,
+                encoder_hidden_states=prompt_embeds_concat.to(dtype=torch.float16),
+                ).sample
+
+            noise_pred_uncond, noise_pred_text = noise_pred_fix.chunk(2)
+            noise_pred_fix = noise_pred_uncond + self.cfg_vsd * (noise_pred_text - noise_pred_uncond)
+            noise_pred_fix.to(dtype=torch.float32)
+
+            x0_pred_fix = eps_to_mu(self.noise_scheduler_reg, noise_pred_fix, noisy_latents, timesteps)
+
+            # update_err = F.mse_loss(denoised_latents, x0_pred_update).mean()
+            # fix_err = F.mse_loss(denoised_latents, x0_pred_fix).mean()
+
+        weighting_factor = torch.abs(denoised_latents - x0_pred_fix).mean(dim=[1, 2, 3], keepdim=True)
+        grad = -(x0_pred_update - x0_pred_fix) / (weighting_factor + 1e-7) 
+
+        # mask HF in the loss
+        if self.use_hf_loss:  
+            with torch.no_grad():
+                # zt_ft = torch.fft.fftshift(torch.fft.fft2(denoised_latents), dim=(-2,-1))
+                # zt_ft = zt_ft * self.HPF # remove low frequencies
+                # zt_hp = torch.real(torch.fft.ifft2(torch.fft.ifftshift(zt_ft))).to(denoised_latents.dtype)
+                # mask = zt_hp
+                # mask = abs(mask).clip(0,self.MASK_CLIP)/self.MASK_CLIP
+                # grad = grad * mask  # this should be convolution, not .*
+
+                grad_ft = torch.fft.fftshift(torch.fft.fft2(grad), dim=(-2,-1))
+                grad_ft = grad_ft * self.HPF # remove low frequencies
+                grad_hp = torch.real(torch.fft.ifft2(torch.fft.ifftshift(grad_ft))).to(denoised_latents.dtype)
+                grad = grad_hp
+
+        # we use this method to calculate loss because grad is computed inside torch.no_grad to save memory. 
+        # if not we have to compute the gradients of unet_fix and unet_update
+        loss_kl = F.mse_loss(denoised_latents, (denoised_latents - grad).detach())
+
+        # calculate total gen loss and update parameters
+        loss_gen = loss_data + self.lambda_kl*loss_kl
+
+        self.accelerator.backward(loss_gen)
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.gen_params, 1.0)
+        self.optimizers[0].step()
+        self.optimizers[0].zero_grad()
+        
+        # loss diff for vsd unet update
+        denoised_latents, prompt_embeds = denoised_latents.detach(), prompt_embeds.detach()
+        noise = torch.randn_like(denoised_latents)
+        timesteps = torch.randint(0, self.noise_scheduler_reg.config.num_train_timesteps, (bsz,), device=denoised_latents.device).long()
+        noisy_latents = self.noise_scheduler_reg.add_noise(denoised_latents, noise, timesteps)
+
+        noise_pred = self.unet_update(
+            noisy_latents,
+            timestep=timesteps,
+            encoder_hidden_states=prompt_embeds,
+            ).sample
+
+        loss_d = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+        self.accelerator.backward(loss_d)
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.reg_params, 1.0)
+        self.optimizers[1].step()
+        self.optimizers[1].zero_grad()
+        return {'all': loss_gen + loss_d, 
+                'kl': loss_kl * self.lambda_kl, 
+                'l2': loss_l2 * self.lambda_l2, 
+                'lpips': loss_lpips * self.lambda_lpips, 
+                'chroma': loss_chroma * self.lambda_chroma,
+                'diff': loss_d,
+                # 'update_err': update_err,
+                # 'fix_err': fix_err,
+                # 'output_min': output_image.min(),
+                # 'output_max': output_image.max(),
+                # 'output_mean': output_image.mean(),
+                }
+    
+    def _get_captions(self, images, bsz):
+        if images.shape[1] == 1:
+            images = einops.repeat(images, 'b 1 h w -> b 3 h w')
+        images = images.clip(-1, 1)
+        return self.prompt_extractor.get_captions(images, bsz)
+
+    def _get_prompt_embeds(self, images, bsz):
+        captions = self._get_captions(images, bsz)
+        return encode_prompt(captions, self.tokenizer, self.text_encoder)
+
+    @torch.no_grad()
+    def calculate_flops(self, *args, n=10, **kwargs):
+        """Measure restoration FLOPs; VLM captioning is excluded."""
+        if self.FLOPS_SAVED:
+            return
+
+        try:
+            from torch.utils.flop_counter import FlopCounterMode
+        except ImportError:
+            self.logger.warning("torch.utils.flop_counter is not installed; cannot compute FLOPs.")
+            return
+
+        lq1 = args[0]
+        bsz = lq1.shape[0]
+        prompt_embeds = encode_prompt([""] * bsz, self.tokenizer, self.text_encoder)
+
+        flop_counter = FlopCounterMode(display=False, depth=None)
+        with flop_counter:
+            self.forwardpass(*args, prompt_embeds=prompt_embeds)
+
+        total_flops = flop_counter.get_total_flops()
+        table = flop_counter.get_table()
+
+        time_list = []
+        for _ in range(n):
+            start_time = time.time()
+            self.forwardpass(*args, prompt_embeds=prompt_embeds)
+            end_time = time.time()
+            time_list.append(end_time - start_time)
+
+        with open(os.path.join(self.opt.path.experiments_root, self.opt.path.logging_dir, "flops_table.txt"), "w") as f:
+            f.write(table)
+        with open(os.path.join(self.opt.path.experiments_root, self.opt.path.logging_dir, "flops_summary.txt"), "w") as f:
+            f.writelines([
+                f"Total FLOPs: {total_flops / 1e9:.3f} GFLOPs\n",
+                f"Average time taken to forward pass: {np.mean(time_list)} seconds\n",
+                f"std: {np.std(time_list)} seconds\n",
+                f"min: {np.min(time_list)} seconds\n",
+                f"max: {np.max(time_list)} seconds\n",
+            ])
+
+        self.FLOPS_SAVED = True
+
+    def optimize_parameters(self):
+        gt_key = self.dataloader.dataset.gt_key
+        lq_key = self.dataloader.dataset.lq_key
+
+        image_1 = self.sample[lq_key]
+        gt_1 = self.sample[gt_key]
+        
+        bsz = image_1.shape[0]
+
+        image_1 = image_1.clip(-1, 1)
+        gt_1 = gt_1.clip(-1, 1)
+
+        if image_1.shape[1] == 1:
+            image_1 = einops.repeat(image_1, 'b 1 h w -> b 3 h w')
+        if gt_1.shape[1] == 1:
+            gt_1 = einops.repeat(gt_1, 'b 1 h w -> b 3 h w')
+ 
+        prompt_embeds = self._get_prompt_embeds(image_1, bsz)
+        neg_prompt_embeds = encode_prompt([self.neg_caption]*bsz, self.tokenizer, self.text_encoder)
+        
+        vae_input = image_1
+
+        latents = self.vae.encode(vae_input).latent_dist.sample() * self.vae.config.scaling_factor
+        if self.use_adapter:
+            down_block_additional_residuals = self.t2iadapter(self.adapter_preprocess(image_1))
+        else:
+            down_block_additional_residuals = None
+            
+        # Predict the noise residual
+        model_pred = self.unet(latents, 
+                                self.timesteps, 
+                                encoder_hidden_states=prompt_embeds, 
+                                down_block_additional_residuals=down_block_additional_residuals, 
+                                return_dict=False)[0]
+
+        # Denoise the latents
+        denoised_latents = self.noise_scheduler.step(model_pred, self.timesteps[0], latents, return_dict=True).prev_sample
+
+
+        return self._optimize_parameters(denoised_latents, gt_1, prompt_embeds, neg_prompt_embeds)
+
+    def forwardpass(self, lq1, prompt_embeds=None):
+        if lq1.shape[1] == 1:
+            lq1 = einops.repeat(lq1, 'b 1 h w -> b 3 h w')
+
+        bsz = lq1.shape[0]
+        if prompt_embeds is None:
+            prompt_embeds = self._get_prompt_embeds(lq1, bsz)
+
+        output = self.pipeline(
+            lq1,
+            None,
+            prompt_embeds=prompt_embeds[:bsz],
+            timesteps=[self.opt.train.timestep],
+        )
+        return output.images
+        
+    
+    @torch.no_grad()
+    def validation(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+        idx = 0
+        for model in self.models:
+            model.eval()
+        noise_scheduler_tmp = DDPMScheduler.from_pretrained(self.opt.pretrained_model_name_or_path, subfolder="scheduler")
+        noise_scheduler_tmp.set_timesteps(timesteps=[self.opt.train.timestep], device='cuda')
+        self.pipeline = OneStepDiffusionPipeline(
+            self.vae,
+            self.unet,
+            noise_scheduler_tmp,
+            concatenate_images=False
+        )
+        if self.is_train:
+            dataloader = DataLoader(Subset(self.dataloader.dataset, np.arange(5)), 
+                                    shuffle=False, 
+                                    batch_size=1)
+            print(f"Tesing using {len(dataloader)} training data...")
+            dataloader = self.accelerator.prepare(dataloader)
+            for batch in dataloader:
+                idx = self.validate_step(batch, idx, self.dataloader.dataset.lq_key, self.dataloader.dataset.gt_key)
+            self.accelerator._dataloaders.remove(dataloader)
+        for batch in tqdm(self.test_dataloader):
+            idx = self.validate_step(batch, idx, self.test_dataloader.dataset.lq_key, self.test_dataloader.dataset.gt_key)
+            if idx >= self.max_val_steps:
+                break
+        if self.is_train:
+            for model in self.models:
+                model.train()
+            
+    def validate_step(self, batch, idx,lq_key,gt_key):
+        self.feed_data(batch, is_train=False)
+        self.calculate_flops(torch.randn(1, 3, 512, 512).to(self.device))
+
+        caption_input = self.sample[lq_key + '_original'] if self.opt.val.patched else self.sample[lq_key]
+        captions = self._get_captions(caption_input, caption_input.shape[0])
+        
+        if self.opt.val.patched:
+            b,c,h,w = self.original_size[lq_key]
+            pred = []
+            for _ in self.setup_patches():    
+                image_1 = self.sample[lq_key]
+                out = self.forwardpass(image_1)
+                pred.append(out)
+            pred = torch.cat(pred, dim=0)
+            pred = einops.rearrange(pred, '(b n) c h w -> b n c h w', b=b)
+            out = []
+            for i in range(len(pred)):
+                merged = merge_patches(pred[i], self.sample[lq_key+'_patched_pos'])
+                out.append(merged[..., :h, :w])
+            lq1 = self.sample[lq_key+'_original']
+            gt = self.sample[gt_key+'_original']
+            out = torch.stack(out)
+        else: 
+            lq1 = self.sample[lq_key]
+            gt = self.sample[gt_key]
+            out = self.forwardpass(lq1)
+
+        lq1 = lq1.cpu().numpy()*0.5+0.5
+        gt = gt.cpu().numpy()*0.5+0.5
+        out = out.cpu().numpy()*0.5+0.5
+        for i in range(len(gt)):
+            idx += 1
+            print(f"[validation {idx:04d}] prompt: {captions[i]}", flush=True)
+            if not self.is_train:
+                log_prompt(self.opt, captions[i], f'prompt_{idx:04d}', self.global_step)
+            image1 = [lq1[i], gt[i], out[i]]
+            for j in range(len(image1)):
+                if image1[j].shape[0] == 1:
+                    image1[j] = einops.repeat(image1[j], '1 h w -> 3 h w')
+            image1 = np.stack(image1)
+            image1 = np.clip(image1, 0, 1)
+            log_image(self.opt, self.accelerator, image1, f'{idx:04d}', self.global_step)  # image format (N,C,H,W)
+            log_image(self.opt, self.accelerator, np.clip(np.stack([out[i]]), 0,1), f'out_{idx:04d}', self.global_step)
+            log_metrics(gt[i], out[i], self.opt.val.metrics, self.accelerator, self.global_step)
+        return idx
+    

@@ -1,0 +1,35 @@
+# Core ML stack
+torch>=2.8.0
+torchvision>=0.23.0
+diffusers==0.35.0
+transformers==4.57.1
+peft==0.17.1
+accelerate==1.1.0
+datasets==3.3.0
+safetensors
+
+# Losses and image processing
+lpips
+einops
+kornia==0.8.1
+opencv-python-headless
+scikit-image
+matplotlib
+Pillow
+
+# Config and utilities
+omegaconf==2.3.0
+pyyaml
+tqdm
+numpy
+scipy
+
+# Experiment tracking (optional)
+tensorboard
+# comet_ml
+# wandb
+
+# Metrics (optional, for analysis/calculate_metrics.py)
+torchmetrics
+pyiqa
+pandas

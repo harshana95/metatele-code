@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Experiments and checkpoints
+experiments/
+logs/
+*.pt
+*.pth
+*.safetensors
+
+# Weights
+weights/
+!weights/.gitkeep
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.tif
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Slurm
+slurm-*.out
+*.err
+
+# TensorBoard / W&B
+runs/
+wandb/
+
+# Dev artifacts
+.claude/
